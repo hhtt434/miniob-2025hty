@@ -1,0 +1,181 @@
+/* Copyright (c) 2021 OceanBase and/or its affiliates. All rights reserved.
+miniob is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+         http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
+//
+// Created by WangYunlai on 2022/12/30.
+//
+
+#include "sql/operator/join_physical_operator.h"
+#include "common/log/log.h"
+
+NestedLoopJoinPhysicalOperator::NestedLoopJoinPhysicalOperator() {}
+
+RC NestedLoopJoinPhysicalOperator::open(Trx *trx)
+{
+  // 【赛题 5 join-tables】基础连接算法是 Nested Loop Join：左侧每产生一行，
+  // 右侧重新 open 并扫描一遍，输出 JoinedTuple(left,right)。
+  if (children_.size() != 2) {
+    LOG_WARN("nlj operator should have 2 children");
+    return RC::INTERNAL;
+  }
+
+  RC rc         = RC::SUCCESS;
+  left_         = children_[0].get();
+  right_        = children_[1].get();
+  right_closed_ = true;
+  round_done_   = true;
+  left_tuple_   = nullptr;
+  right_tuple_  = nullptr;
+  joined_tuple_.set_left(nullptr);
+  joined_tuple_.set_right(nullptr);
+
+  rc   = left_->open(trx);
+  trx_ = trx;
+  LOG_INFO("nested loop join open. this=%p", this);
+  return rc;
+}
+
+RC NestedLoopJoinPhysicalOperator::next()
+{
+  // 状态机等价于双重循环：for each left，reopen(right)，for each right emit。
+  // 无索引时复杂度约 O(|L|×|R|)，多表查询通过左深 Join 树继续组合。
+  bool left_need_step = (left_tuple_ == nullptr);
+  RC   rc             = RC::SUCCESS;
+  if (round_done_) {
+    left_need_step = true;
+  } else {
+    rc = right_next();
+    if (rc != RC::SUCCESS) {
+      if (rc == RC::RECORD_EOF) {
+        left_need_step = true;
+      } else {
+        return rc;
+      }
+    } else {
+      return rc;  // got one tuple from right
+    }
+  }
+
+  if (left_need_step) {
+    rc = left_next();
+    if (rc != RC::SUCCESS) {
+      return rc;
+    }
+  }
+
+  rc = right_next();
+  return rc;
+}
+
+RC NestedLoopJoinPhysicalOperator::close()
+{
+  RC rc = left_->close();
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to close left oper. rc=%s", strrc(rc));
+  }
+
+  if (!right_closed_) {
+    rc = right_->close();
+    if (rc != RC::SUCCESS) {
+      LOG_WARN("failed to close right oper. rc=%s", strrc(rc));
+    } else {
+      right_closed_ = true;
+    }
+  }
+  return rc;
+}
+
+Tuple *NestedLoopJoinPhysicalOperator::current_tuple()
+{
+  // 拷贝
+  auto left_base_rids  = joined_tuple_.left_base_rids();
+  auto right_base_rids = joined_tuple_.right_base_rids();
+  left_base_rids.insert(left_base_rids.end(), right_base_rids.begin(), right_base_rids.end());
+  joined_tuple_.set_base_rids(left_base_rids);
+
+  return &joined_tuple_;
+}
+
+RC NestedLoopJoinPhysicalOperator::tuple_schema(TupleSchema &schema) const
+{
+  schema = TupleSchema();
+  if (children_.size() != 2) {
+    return RC::INTERNAL;
+  }
+
+  for (size_t child_idx = 0; child_idx < 2; child_idx++) {
+    TupleSchema child_schema;
+    RC          rc = children_[child_idx]->tuple_schema(child_schema);
+    if (rc == RC::SUCCESS) {
+      const int cell_num = child_schema.cell_num();
+      for (int i = 0; i < cell_num; i++) {
+        schema.append_cell(child_schema.cell_at(i));
+      }
+    } else if (rc == RC::UNIMPLEMENTED) {
+      return RC::UNIMPLEMENTED;
+    } else {
+      return rc;
+    }
+  }
+
+  if (schema.cell_num() == 0) {
+    return RC::UNIMPLEMENTED;
+  }
+  return RC::SUCCESS;
+}
+
+RC NestedLoopJoinPhysicalOperator::left_next()
+{
+  RC rc = RC::SUCCESS;
+  rc    = left_->next();
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+
+  left_tuple_ = left_->current_tuple();
+  joined_tuple_.set_left(left_tuple_);
+  return rc;
+}
+
+RC NestedLoopJoinPhysicalOperator::right_next()
+{
+  RC rc = RC::SUCCESS;
+  if (round_done_) {
+    if (!right_closed_) {
+      rc = right_->close();
+
+      right_closed_ = true;
+      if (rc != RC::SUCCESS) {
+        return rc;
+      }
+    }
+
+    // 右孩子必须支持反复 close/open；阻塞算子 reopen 状态不完整会造成多轮 Join 丢行。
+    rc = right_->open(trx_);
+    if (rc != RC::SUCCESS) {
+      return rc;
+    }
+    right_closed_ = false;
+
+    round_done_ = false;
+  }
+
+  rc = right_->next();
+  if (rc != RC::SUCCESS) {
+    if (rc == RC::RECORD_EOF) {
+      round_done_ = true;
+    }
+    return rc;
+  }
+
+  right_tuple_ = right_->current_tuple();
+  joined_tuple_.set_right(right_tuple_);
+  return rc;
+}

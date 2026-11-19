@@ -1,0 +1,79 @@
+/* Copyright (c) 2021 OceanBase and/or its affiliates. All rights reserved.
+miniob is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+         http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
+//
+// Created by WangYunlai on 2022/07/01.
+//
+
+#include "sql/operator/project_physical_operator.h"
+#include "common/log/log.h"
+#include "storage/record/record.h"
+#include "storage/table/table.h"
+
+using namespace std;
+
+ProjectPhysicalOperator::ProjectPhysicalOperator(vector<unique_ptr<Expression>> &&expressions)
+    : expressions_(std::move(expressions)), tuple_(expressions_)
+{}
+
+RC ProjectPhysicalOperator::open(Trx *trx)
+{
+  if (children_.empty()) {
+    return RC::SUCCESS;
+  }
+
+  PhysicalOperator *child = children_[0].get();
+  RC                rc    = child->open(trx);
+  if (rc != RC::SUCCESS) {
+    LOG_WARN("failed to open child operator: %s", strrc(rc));
+    return rc;
+  }
+
+  return RC::SUCCESS;
+}
+
+RC ProjectPhysicalOperator::next()
+{
+  if (children_.empty()) {
+    return RC::RECORD_EOF;
+  }
+  return children_[0]->next();
+}
+
+RC ProjectPhysicalOperator::close()
+{
+  if (!children_.empty()) {
+    children_[0]->close();
+  }
+  return RC::SUCCESS;
+}
+
+Tuple *ProjectPhysicalOperator::current_tuple()
+{
+  auto tuple = children_[0]->current_tuple();
+  tuple_.set_tuple(tuple);
+  // 虽然 ExpressionTuple 会从 child_tuple_ 获取 base_rids，
+  // 但为了确保兼容性，仍然显式设置一次
+  tuple_.set_base_rids(tuple->base_rids());
+  return &tuple_;
+}
+
+RC ProjectPhysicalOperator::tuple_schema(TupleSchema &schema) const
+{
+  for (const unique_ptr<Expression> &expression : expressions_) {
+    // Use alias if available, otherwise use name
+    if (expression->has_alias()) {
+      schema.append_cell(expression->alias());
+    } else {
+      schema.append_cell(expression->name());
+    }
+  }
+  return RC::SUCCESS;
+}
