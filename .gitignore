@@ -39,3 +39,5 @@ logs/
 
 # runtime database files
 db/
+!src/observer/storage/db/
+!src/observer/storage/db/**
